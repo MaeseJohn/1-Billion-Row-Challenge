@@ -7,10 +7,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
-	"sync"
 )
-
-const numWorkers = 1 // Número de trabajadores en el pool
 
 func main() {
 	archivo, err := os.Open("measurements_50M.txt")
@@ -22,17 +19,44 @@ func main() {
 
 	reader := bufio.NewReader(archivo)
 	estaciónTemperatura := make(map[string][]float64)
-	var mu sync.Mutex
-	var wg sync.WaitGroup
 
-	// Lanzar trabajadores
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go worker(reader, &mu, &estaciónTemperatura, &wg)
+	for {
+		linea, err := reader.ReadBytes('\n')
+		if err != nil {
+			break
+		}
+
+		semicolonIndex := -1
+		for i, char := range linea {
+			if char == ';' {
+				semicolonIndex = i
+				break
+			}
+		}
+		if semicolonIndex == -1 {
+			break
+		}
+
+		nombre := string(linea[:semicolonIndex])
+		numero, err := strconv.ParseFloat(string(linea[semicolonIndex+1:len(linea)-1]), 64)
+		if err != nil {
+			fmt.Println("Error al convertir la temperatura a número:", err)
+			break
+		}
+
+		if array, exist := estaciónTemperatura[nombre]; !exist {
+			estaciónTemperatura[nombre] = []float64{numero, numero, numero, 1.0}
+		} else {
+			array[1] += numero
+			array[3]++
+			if numero < array[0] {
+				array[0] = numero
+			}
+			if numero > array[2] {
+				array[2] = numero
+			}
+		}
 	}
-
-	// Esperar a que todos los trabajadores terminen
-	wg.Wait()
 
 	// Resto del código para ordenar y mostrar resultados
 	var claves [][]byte
@@ -56,53 +80,6 @@ func main() {
 		fmt.Print(", ")
 	}
 	fmt.Print("}")
-}
-
-func worker(reader *bufio.Reader, mu *sync.Mutex, estaciónTemperatura *map[string][]float64, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	for {
-		mu.Lock()
-		linea, err := reader.ReadBytes('\n')
-		mu.Unlock()
-
-		if err != nil {
-			break
-		}
-
-		semicolonIndex := -1
-		for i, char := range linea {
-			if char == ';' {
-				semicolonIndex = i
-				break
-			}
-		}
-		if semicolonIndex == -1 {
-			break
-		}
-
-		nombre := string(linea[:semicolonIndex])
-		numero, err := strconv.ParseFloat(string(linea[semicolonIndex+1:len(linea)-1]), 64)
-		if err != nil {
-			fmt.Println("Error al convertir la temperatura a número:", err)
-			break
-		}
-
-		mu.Lock()
-		if array, exist := (*estaciónTemperatura)[nombre]; !exist {
-			(*estaciónTemperatura)[nombre] = []float64{numero, numero, numero, 1.0}
-		} else {
-			array[1] += numero
-			array[3]++
-			if numero < array[0] {
-				array[0] = numero
-			}
-			if numero > array[2] {
-				array[2] = numero
-			}
-		}
-		mu.Unlock()
-	}
 }
 
 // ByteSlice es una implementación de la interfaz sort.Interface para slices de bytes.
