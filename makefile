@@ -4,4 +4,4 @@ test:
 
 #Speed
 speed:
-	/usr/bin/time -v go run main.go 
+	hyperfine --warmup 1 'go run main.go'

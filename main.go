@@ -1,22 +1,25 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 func main() {
-	fmt.Println(createFinalString())
+	fmt.Printf(evaluate("measurements_50M.txt"))
 }
 
-func createFinalString() string {
-
-	tempMap, err := readFileLineByLineIntoAMap("measurements_50M.txt")
+func evaluate(file string) string {
+	tempMap, err := readFileLineByLineIntoAMap(file)
 	if err != nil {
 		panic(err)
 	}
@@ -29,6 +32,7 @@ func createFinalString() string {
 	}
 
 	sort.Strings(resultArr)
+
 	var stringsBuilder strings.Builder
 	for _, i := range resultArr {
 		stringsBuilder.WriteString(fmt.Sprintf("%s=%.1f/%.1f/%.1f, ", i,
@@ -39,95 +43,138 @@ func createFinalString() string {
 	return stringsBuilder.String()[:stringsBuilder.Len()-2]
 }
 
-type minMaxSumCount struct {
+type cityTemperatureInfo struct {
+	count int64
 	min   int64
 	max   int64
 	sum   int64
-	count int64
 }
 
-func readFileLineByLineIntoAMap(path string) (map[string]minMaxSumCount, error) {
-	file, err := os.Open(path)
+func readFileLineByLineIntoAMap(filepath string) (map[string]cityTemperatureInfo, error) {
+	file, err := os.Open(filepath)
 	if err != nil {
 		panic(err)
 	}
+	defer file.Close()
 
-	chanOwner := func() <-chan []string {
-		//We send a chunck of lines to reduce the number of items send on the channel
-		//Buffered channel 100 lines
-		resultChan := make(chan []string, 100)
-		//Separating blocks of 100 lines
-		toSend := make([]string, 100)
+	tempMap := make(map[string]cityTemperatureInfo)
+	resultChan := make(chan map[string]cityTemperatureInfo, 10)
+	chunkChan := make(chan []byte, 15)
+	chunkSize := 64 * 1024 * 1024
+	var wg sync.WaitGroup
 
-		//Making a go routine for reading lines and send it throw 'resultchan'
+	// spawn workers to consume (process) file chunks read
+	for i := 0; i < runtime.NumCPU()-1; i++ {
+		wg.Add(1)
 		go func() {
-			defer close(resultChan)
-			scanner := bufio.NewScanner(file)
-			var count int
-			//.Scan() reads the file until it finds a \n and returns it
-			for scanner.Scan() {
-				if count == 100 {
-					//To avoid race condition we will need to create a copy of the slice to send it over to the channel
-					//// Note: i think this happends becouse we are sending a referens of the slice into a channel ////
-					localCopy := make([]string, 100)
-					copy(localCopy, toSend)
-					resultChan <- localCopy
-					count = 0
-				}
-				//Adding lines to the sendArray
-				toSend[count] = scanner.Text()
-				count++
+			for chunk := range chunkChan {
+				processReadChunk(chunk, resultChan)
 			}
-			if count != 0 {
-				resultChan <- toSend[:count]
-			}
+			wg.Done()
 		}()
-		return resultChan
 	}
 
-	resultChan := chanOwner()
-	tempMap := make(map[string]minMaxSumCount)
-	//For each array/slice in the channel
-	for lineSlice := range resultChan {
-		//For each line of the slice
-		for _, line := range lineSlice {
-			//Try to separete the city string to the temperature value
-			index := strings.Index(line, ";")
-			if index == -1 {
-				continue
+	// spawn a goroutine to read file in chunks and send it to the chunk channel for further processing
+	go func() {
+		buf := make([]byte, chunkSize)
+		remains := make([]byte, 0, chunkSize)
+		for {
+			readChunk, err := file.Read(buf)
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				panic(err)
 			}
-			city := line[:index]
-			temp := stringToInt64(line[index+1:])
-			//Check if the city exist in the map
-			//Is exist count++ sum+new value, and check if the new value is less than the min or greater than the max
-			if num, ok := tempMap[city]; ok {
-				num.count++
-				num.sum += temp
-				if temp < num.min {
-					num.min = temp
+			buf = buf[:readChunk]
+
+			toSend := make([]byte, readChunk)
+			copy(toSend, buf)
+
+			lastNewLineIndex := bytes.LastIndex(buf, []byte{'\n'})
+
+			toSend = append(remains, buf[:lastNewLineIndex+1]...)
+			remains = make([]byte, len(buf[lastNewLineIndex+1:]))
+			copy(remains, buf[lastNewLineIndex+1:])
+
+			chunkChan <- toSend
+
+		}
+		close(chunkChan)
+
+		// wait for all chunks to be proccessed before closing the result stream
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// process all city temperatures derived after processing the file chunks
+	for t := range resultChan {
+		for city, tempInfo := range t {
+			if val, ok := tempMap[city]; ok {
+				val.count += tempInfo.count
+				val.sum += tempInfo.sum
+				if tempInfo.min < val.min {
+					val.min = tempInfo.min
 				}
-				if temp > num.max {
-					num.max = temp
+
+				if tempInfo.max > val.max {
+					val.max = tempInfo.max
 				}
-				tempMap[city] = num
+				tempMap[city] = val
 			} else {
-				//Else create a new minMaxSumCount object
-				tempMap[city] = minMaxSumCount{
-					min:   temp,
-					max:   temp,
-					sum:   temp,
-					count: 1,
-				}
+				tempMap[city] = tempInfo
 			}
 		}
 	}
+
 	return tempMap, nil
 }
 
-func stringToInt64(input string) int64 {
+func convertStringToInt64(input string) int64 {
 	input = input[:len(input)-2] + input[len(input)-1:]
 	output, _ := strconv.ParseInt(input, 10, 64)
 	return output
+}
+
+func processReadChunk(buf []byte, resultChan chan<- map[string]cityTemperatureInfo) {
+	var stringsBuilder strings.Builder
+	toSend := make(map[string]cityTemperatureInfo)
+	var city string
+
+	for _, char := range buf {
+		if char == ';' {
+			city = stringsBuilder.String()
+			stringsBuilder.Reset()
+		} else if char == '\n' {
+			if stringsBuilder.Len() != 0 && len(city) != 0 {
+				temp := convertStringToInt64(stringsBuilder.String())
+				stringsBuilder.Reset()
+
+				if val, ok := toSend[city]; ok {
+					val.count++
+					val.sum += temp
+					if temp < val.min {
+						val.min = temp
+					}
+
+					if temp > val.max {
+						val.max = temp
+					}
+					toSend[city] = val
+				} else {
+					toSend[city] = cityTemperatureInfo{
+						count: 1,
+						min:   temp,
+						max:   temp,
+						sum:   temp,
+					}
+				}
+			}
+		} else {
+			stringsBuilder.WriteByte(char)
+		}
+	}
+	resultChan <- toSend
 }
 
 func round(x float64) float64 {
